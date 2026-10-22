@@ -23,3 +23,6 @@ private_key.pem
 
 # Bundled copy of the project
 /ENDSEM_READY.zip
+
+# Generated voting test data and private keys
+/tmp/evoting_check*/
