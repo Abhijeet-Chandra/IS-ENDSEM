@@ -1,0 +1,25 @@
+# Python environments and generated caches
+venv/
+venv1/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Local editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local secrets and generated private keys
+.env
+.env.*
+!.env.example
+private_key.pem
+*_private.pem
+
+# Bundled copy of the project
+/ENDSEM_READY.zip
