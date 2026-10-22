@@ -40,7 +40,7 @@ def check(row):
         def request(action, role='writer', username='writer', **kwargs):
             return server.handle_request(username, role, {'action': action, **kwargs})
 
-        text = 'Fever, fever! followup café 你好 ' + 'long document ' * 200
+        text = 'Fever, fever! followup cafÃ© ä½ å¥½ ' + 'long document ' * 200
         assert request('upload', report_id='R101', content=text)['status'] == 'ok'
         result = request('get', report_id='R101')
         assert result['status'] == 'ok' and result['content'] == text, result
@@ -48,7 +48,7 @@ def check(row):
         assert result['signature_verified']
         assert request('verify', 'auditor', 'auditor', report_id='R101')['verified']
         assert request('search', query='FEVER!')['report_ids'] == ['R101']
-        assert request('search', query='café')['report_ids'] == ['R101']
+        assert request('search', query='cafÃ©')['report_ids'] == ['R101']
         assert request('search', query='missing')['report_ids'] == []
         assert request('search', query='two words')['status'] == 'error'
         assert request('search', query='')['status'] == 'error'
@@ -65,8 +65,8 @@ def check(row):
         for number in range(2, 11):
             assert request('upload', report_id=f'R{number:03}', content=f'fever common entry {number}')['status'] == 'ok'
         assert len(request('search', query='fever')['report_ids']) == 10
-        assert request('upload', report_id='文档', content='unicode identifier')['status'] == 'ok'
-        assert request('search', query='unicode')['report_ids'] == ['文档']
+        assert request('upload', report_id='æ–‡æ¡£', content='unicode identifier')['status'] == 'ok'
+        assert request('search', query='unicode')['report_ids'] == ['æ–‡æ¡£']
 
         # Corrupt digest, signature and ciphertext separately. Never return plaintext.
         saved = copy.deepcopy(server.REPORTS['R101'])
@@ -97,7 +97,7 @@ def check(row):
             expected = sample + 'X' * (-len(sample) % 5)
         assert demo['decrypted_text'] == expected, (name, demo, expected)
         assert request('classical', text='')['status'] == 'ok'
-        assert request('classical', text='café')['status'] == 'error'
+        assert request('classical', text='cafÃ©')['status'] == 'error'
         known = {'Vigenere': 'OILWH', 'Additive': 'BYFFI', 'Multiplicative': 'BIJJC',
                  'Affine': 'VCDDW', 'Autokey': 'OLPWZ', 'Hill': 'HQOVHH'}
         if name in known:
@@ -154,12 +154,25 @@ def live_cli(row):
                         raise AssertionError('Server did not start')
                     time.sleep(.1)
             inputs = 'admin\nadmin123\n1\nR101\nfever report\n2\nR101\n3\nFEVER!\n6\nR101\n7\nHELLO\n8\n7\n3\n0\n'
+            if row['folder'] == 'COMBO_02_University_Results':
+                inputs = ('invalid\n1\n1\n\nR101\n\nfever report\n2\nR101\n3\nFEVER!\n'
+                          '4\n5\n6\nR101\n7\nHELLO\n8\noops\n-1\n7\n3\n'
+                          '9\n3\n2\nR101\n9\n4\n6\nR101\n9\n2\n2\nR101\n0\n')
             result = subprocess.run([sys.executable, str(folder / 'client.py')], input=inputs, text=True, capture_output=True, timeout=60)
             assert result.returncode == 0, result.stderr
             assert 'Client hash check: True' in result.stdout
             assert '"verified": true' in result.stdout
             assert '"decrypted_result":' in result.stdout
-            assert '"status": "error"' not in result.stdout, result.stdout
+            if row['folder'] == 'COMBO_02_University_Results':
+                assert result.stdout.count('"status": "error"') == 1, result.stdout
+                assert 'Permission denied for this role' in result.stdout
+                assert 'Username:' not in result.stdout and 'Password:' not in result.stdout
+                assert '"decrypted_result": 21' in result.stdout
+                assert '"ciphertext": "BYFFI"' in result.stdout
+                for user in ('admin', 'writer', 'reader', 'auditor'):
+                    assert 'Selected user: ' + user in result.stdout
+            else:
+                assert '"status": "error"' not in result.stdout, result.stdout
         finally:
             proc.terminate()
             proc.wait(timeout=10)
@@ -173,7 +186,7 @@ if __name__ == '__main__':
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         for name in pool.map(check, ROWS):
             print('PASS', name, flush=True)
-    for row in (ROWS[0], ROWS[-1]):
+    for row in (ROWS[0], ROWS[1], ROWS[-1]):
         live_cli(row)
         print('PASS live client/server', row['folder'], flush=True)
-    print('All 36 combinations and both live CLI runs passed.', flush=True)
+    print('All 36 combinations and three live CLI runs passed.', flush=True)

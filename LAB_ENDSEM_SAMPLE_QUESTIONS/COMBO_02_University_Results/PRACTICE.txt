@@ -12,22 +12,25 @@ RUN (two terminals opened in this folder)
 3. Second terminal: python client.py
 Port: 5102. Each example has a separate port.
 
-LOGIN
-admin/admin123: all actions
-writer/write123: upload, read, search, list, classical cipher, homomorphic demo
-reader/read123: search and list IDs only
-auditor/audit123: verify, list and view log
+CHOOSE USER (no username/password typing)
+1. Admin: all actions
+2. Writer: upload, read, search, list, classical cipher, homomorphic demo
+3. Reader: search and list IDs only
+4. Auditor: verify, list and view log
+0. Exit
+The client sends the selected demo account automatically; the server still
+enforces its permissions. Action 9 returns to user selection. Action 0 exits.
 
 TRY THIS
-1. Log in as writer; option 1; ID R101; text: algebra passed distinction
+1. Select user 2 (Writer); option 1; ID R101; text: algebra passed distinction
 2. Option 2, R101: original text, digest and signature_verified=true.
    Client hash check must also be True.
 3. Option 3, algebra: R101. Uppercase/punctuation also match.
 4. Option 7, HELLO: see Additive ciphertext and decrypted text.
 5. Option 8, 7 and 3: decrypted_result = 21.
    Ciphertexts are combined before the final result is decrypted.
-6. Quit, reconnect as reader and attempt option 2: permission denied.
-7. Reconnect as auditor; option 6, R101: verified=true.
+6. Choose action 9, select user 3 (Reader) and attempt option 2: permission denied.
+7. Choose action 9, select user 4 (Auditor); option 6, R101: verified=true.
 8. Upload ten IDs with different texts; search a shared keyword and a missing word.
 9. Duplicate R101, blank ID and a two-word search should give clear errors.
 
