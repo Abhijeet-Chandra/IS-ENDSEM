@@ -1,0 +1,9 @@
+{
+  "classical": "Additive",
+  "symmetric": "AES-256",
+  "hash": "SHA512",
+  "asymmetric": "RSA",
+  "signature": "ElGamal",
+  "homomorphic": "Paillier",
+  "search": "SSE"
+}
