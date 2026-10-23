@@ -1,5 +1,5 @@
 {
-  "title": "Hospital Records",
+  "title": "hospital records",
   "record_name": "report",
   "fields": [
     {
@@ -10,14 +10,14 @@
       "count": false
     },
     {
-      "name": "age",
-      "type": "integer",
+      "name": "condition",
+      "type": "text",
       "search": false,
       "sum": false,
       "count": false
     },
     {
-      "name": "condition",
+      "name": "bill",
       "type": "integer",
       "search": false,
       "sum": true,
@@ -25,6 +25,6 @@
     }
   ],
   "use_deadline": false,
-  "close_on_aggregate": true,
-  "min_records": 3
+  "close_on_aggregate": false,
+  "min_records": 2
 }

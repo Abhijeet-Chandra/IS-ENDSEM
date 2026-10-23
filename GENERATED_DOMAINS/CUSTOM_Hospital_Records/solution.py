@@ -57,10 +57,12 @@ FOLDERS = [
 # =========================================================
 
 
-DOMAIN = {'title': 'Hospital Records', 'record_name': 'report', 'fields': [{'name': 'patient_name', 'type': 'text', 'search': True, 'sum': False, 'count': False}, {'name': 'age', 'type': 'integer', 'search': False, 'sum': False, 'count': False}, {'name': 'condition', 'type': 'integer', 'search': False, 'sum': True, 'count': False}], 'use_deadline': False, 'close_on_aggregate': True, 'min_records': 3}
+ALGORITHMS = {'encryption': 'AES-192', 'hash': 'SHA-256', 'key': 'ECDH', 'signature': 'RSA', 'search': 'PKSE'}
+
+DOMAIN = {'title': 'hospital records', 'record_name': 'report', 'fields': [{'name': 'patient_name', 'type': 'text', 'search': True, 'sum': False, 'count': False}, {'name': 'condition', 'type': 'text', 'search': False, 'sum': False, 'count': False}, {'name': 'bill', 'type': 'integer', 'search': False, 'sum': True, 'count': False}], 'use_deadline': False, 'close_on_aggregate': False, 'min_records': 2}
 ENTITIES = {'Patient': ['submit_record'], 'Doctor': ['verify_record', 'view_record', 'search_records'], 'Receptionist': ['aggregate_records', 'threshold_decrypt']}
 DOMAIN_ACTIONS = {'submit_record': 'Submit record: hash, sign, encrypt, protect key, encrypt totals and index', 'verify_record': 'Verify record: decrypt internally, compare hashes/signature and validate metadata', 'view_record': 'Verify and display plaintext record', 'search_records': 'Search configured fields or submission time (IDs only)', 'aggregate_records': 'Aggregate all verified encrypted totals and category counts', 'threshold_decrypt': 'Decrypt aggregate using both authority passwords'}
-METRICS = {'record_count': {'kind': 'record_count', 'label': 'Record count', 'scale': 1, 'decimals': 0}, 'sum_2': {'kind': 'sum', 'label': 'Total condition', 'field': 'condition', 'scale': 1, 'decimals': 0}}
+METRICS = {'record_count': {'kind': 'record_count', 'label': 'Record count', 'scale': 1, 'decimals': 0}, 'sum_2': {'kind': 'sum', 'label': 'Total bill', 'field': 'bill', 'scale': 1, 'decimals': 0}}
 
 def now():
     return datetime.now(IST).strftime(TIME_FORMAT)
@@ -452,6 +454,155 @@ def seal(value):
     ).hexdigest()
 
 
+from Crypto.Cipher import DES, DES3
+from Crypto.PublicKey import ECC, DSA
+from Crypto.Protocol.DH import key_agreement
+from Crypto.Signature import pkcs1_15
+
+_original_setup = setup
+_original_generate_signing_keys = generate_signing_keys
+_original_sign_hash = sign_hash
+_original_signature_values = signature_values
+_original_encrypt_key = rsa_encrypt_key
+_original_decrypt_key = rsa_decrypt_key
+_original_search_token = search_token
+
+
+def setup():
+    _original_setup()
+    if ALGORITHMS['key'] == 'ECDH' and not (BASE/'keys'/'ecdh_private.json').exists():
+        key = ECC.generate(curve='P-256')
+        save('keys', 'ecdh_private.json', key.export_key(format='PEM'))
+        save('keys', 'ecdh_public.json', key.public_key().export_key(format='PEM'))
+    if ALGORITHMS['signature'] == 'Schnorr' and not (BASE/'keys'/'schnorr.json').exists():
+        group = DSA.generate(2048)
+        save('keys', 'schnorr.json', {name: int(getattr(group, name)) for name in ('p','q','g')})
+    if ALGORITHMS['search'] == 'PKSE' and not (BASE/'keys'/'search_private.json').exists():
+        key = RSA.generate(2048)
+        save('keys', 'search_private.json', key.export_key().decode())
+        save('keys', 'search_public.json', key.publickey().export_key().decode())
+
+
+def document_key():
+    size = {'AES-128':16, 'AES-192':24, 'AES-256':32, 'DES':8, 'Triple-DES':24}[ALGORITHMS['encryption']]
+    key = os.urandom(size)
+    return DES3.adjust_key_parity(key) if ALGORITHMS['encryption'] == 'Triple-DES' else key
+
+
+def document_cipher():
+    return {'DES':DES, 'Triple-DES':DES3}.get(ALGORITHMS['encryption'], AES)
+
+
+def aes_encrypt(plaintext, key):
+    algorithm = document_cipher()
+    cipher = algorithm.new(key, algorithm.MODE_CBC)
+    return cipher.iv.hex(), cipher.encrypt(pad(plaintext.encode(), algorithm.block_size)).hex()
+
+
+def aes_decrypt(ciphertext, key, iv):
+    algorithm = document_cipher()
+    cipher = algorithm.new(key, algorithm.MODE_CBC, iv=bytes.fromhex(iv))
+    return unpad(cipher.decrypt(bytes.fromhex(ciphertext)), algorithm.block_size).decode()
+
+
+def hash_message(message):
+    return hashlib.new(ALGORITHMS['hash'].lower().replace('-', ''), message.encode()).hexdigest()
+
+
+def rsa_encrypt_key(key):
+    if ALGORITHMS['key'] == 'RSA':
+        return _original_encrypt_key(key)
+    ephemeral = ECC.generate(curve='P-256')
+    public = ECC.import_key(read('keys', 'ecdh_public.json'))
+    secret = key_agreement(eph_priv=ephemeral, static_pub=public, kdf=lambda x: SHA256.new(x).digest())
+    cipher = AES.new(secret, AES.MODE_EAX)
+    ciphertext, tag = cipher.encrypt_and_digest(key)
+    return {'public':ephemeral.public_key().export_key(format='PEM'), 'nonce':cipher.nonce.hex(),
+            'tag':tag.hex(), 'ciphertext':ciphertext.hex()}
+
+
+def rsa_decrypt_key(ciphertext):
+    if ALGORITHMS['key'] == 'RSA':
+        return _original_decrypt_key(ciphertext)
+    private = ECC.import_key(read('keys','ecdh_private.json'))
+    public = ECC.import_key(ciphertext['public'])
+    secret = key_agreement(static_priv=private, eph_pub=public, kdf=lambda x: SHA256.new(x).digest())
+    cipher = AES.new(secret, AES.MODE_EAX, nonce=bytes.fromhex(ciphertext['nonce']))
+    return cipher.decrypt_and_verify(bytes.fromhex(ciphertext['ciphertext']), bytes.fromhex(ciphertext['tag']))
+
+
+def generate_signing_keys():
+    if ALGORITHMS['signature'] == 'ElGamal':
+        return _original_generate_signing_keys()
+    if ALGORITHMS['signature'] == 'RSA':
+        key = RSA.generate(2048)
+        return key.export_key(), {'pem':key.publickey().export_key().decode()}
+    group = read('keys','schnorr.json')
+    private = secrets.randbelow(group['q']-1)+1
+    return private, {**group, 'y':pow(group['g'],private,group['p'])}
+
+
+def schnorr_challenge(digest, commitment, public):
+    message = json.dumps([digest, commitment, public['p'], public['q'], public['g'], public['y']], separators=(',', ':'))
+    return int.from_bytes(hashlib.sha256(message.encode()).digest(), 'big') % public['q']
+
+
+def sign_hash(digest, private, public):
+    if ALGORITHMS['signature'] == 'ElGamal':
+        return _original_sign_hash(digest, private, public)
+    if ALGORITHMS['signature'] == 'RSA':
+        return pkcs1_15.new(RSA.import_key(private)).sign(SHA256.new(bytes.fromhex(digest))).hex()
+    nonce = secrets.randbelow(public['q']-1)+1
+    commitment = pow(public['g'],nonce,public['p'])
+    challenge = schnorr_challenge(digest,commitment,public)
+    return [challenge, (nonce+private*challenge) % public['q']]
+
+
+def signature_values(digest, signature, public):
+    if ALGORITHMS['signature'] == 'ElGamal':
+        return _original_signature_values(digest, signature, public)
+    if ALGORITHMS['signature'] == 'RSA':
+        key = RSA.import_key(public['pem'])
+        # PKCS#1 v1.5 SHA-256 DigestInfo, signing the selected document digest.
+        info = bytes.fromhex('3031300d060960864801650304020105000420') + SHA256.new(bytes.fromhex(digest)).digest()
+        size = key.size_in_bytes()
+        expected = b'\x00\x01' + b'\xff'*(size-len(info)-3) + b'\x00' + info
+        data = bytes.fromhex(signature)
+        value = int.from_bytes(data,'big')
+        if len(data) != size or value >= key.n:
+            return expected.hex(), 'INVALID SIGNATURE'
+        return expected.hex(), pow(value,key.e,key.n).to_bytes(size,'big').hex()
+    challenge, response = signature
+    if not (0 <= challenge < public['q'] and 0 <= response < public['q']):
+        return 'VALID RANGE', 'INVALID SIGNATURE'
+    commitment = pow(public['g'],response,public['p']) * pow(pow(public['y'],challenge,public['p']),-1,public['p']) % public['p']
+    return challenge, schnorr_challenge(digest,commitment,public)
+
+
+def search_token(value):
+    if ALGORITHMS['search'] == 'SSE':
+        return _original_search_token(value)
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def index_token(value):
+    token = search_token(value)
+    if ALGORITHMS['search'] == 'SSE':
+        return token
+    public = RSA.import_key(read('keys','search_public.json'))
+    return PKCS1_OAEP.new(public,hashAlgo=SHA256).encrypt(bytes.fromhex(token)).hex()
+
+
+def stored_search_token(token):
+    if ALGORITHMS['search'] == 'SSE':
+        return token
+    private = RSA.import_key(read('keys','search_private.json'))
+    return PKCS1_OAEP.new(private,hashAlgo=SHA256).decrypt(bytes.fromhex(token)).hex()
+
+
+def indexes_match(stored, expected):
+    return set(stored) == set(expected) and all(hmac.compare_digest(stored_search_token(stored[k]), stored_search_token(expected[k])) for k in stored)
+
 from decimal import Decimal, InvalidOperation
 
 
@@ -512,9 +663,9 @@ def metric_values(record):
 
 
 def make_index(record, timestamp):
-    result = {field["name"]: search_token(field["name"] + ":" + str(record[field["name"]]).casefold())
+    result = {field["name"]: index_token(field["name"] + ":" + str(record[field["name"]]).casefold())
               for field in DOMAIN["fields"] if field["search"]}
-    result["__minute__"] = search_token("minute:" + timestamp[:16])
+    result["__minute__"] = index_token("minute:" + timestamp[:16])
     return result
 
 
@@ -546,9 +697,9 @@ def submit_record(record_id, values):
     for name, value in metric_values(record).items():
         encrypted[name], randomness[name] = timed("Paillier encryption", paillier_encrypt, value, n)
     payload = json.dumps({"record": record, "randomness": randomness}, ensure_ascii=False)
-    key = os.urandom(32)
-    iv, ciphertext = timed("AES encryption", aes_encrypt, payload, key)
-    wrapped = timed("RSA key encryption", rsa_encrypt_key, key)
+    key = document_key()
+    iv, ciphertext = timed(ALGORITHMS["encryption"] + " encryption", aes_encrypt, payload, key)
+    wrapped = timed(ALGORITHMS["key"] + " key encryption", rsa_encrypt_key, key)
     timestamp = now()
     settings = read("keys", "settings.json")
     if not settings["start"] <= timestamp <= settings["deadline"]:
@@ -561,8 +712,8 @@ def submit_record(record_id, values):
         save(folder, filename, value)
     save("receipts", filename, seal(record_files(filename)))
     show_summary("Submit " + DOMAIN["record_name"], {"Record ID": record_id,
-        "SHA-512": digest, "ElGamal signature": signature, "IV": iv,
-        "AES ciphertext": ciphertext, "RSA-wrapped key": wrapped,
+        ALGORITHMS["hash"]: digest, ALGORITHMS["signature"] + " signature": signature, "IV": iv,
+        ALGORITHMS["encryption"] + " ciphertext": ciphertext, ALGORITHMS["key"] + "-wrapped key": wrapped,
         "Encrypted totals": encrypted, "Submitted at IST": timestamp, "Result": "SUBMITTED"})
     return True
 
@@ -575,8 +726,8 @@ def check_record(record_id):
     stored_hash = read("hashes", filename)
     signature = read("signature", filename)
     public_key = read("public_key", filename)
-    key = timed("RSA key decryption", rsa_decrypt_key, read("encrypted_key", filename))
-    payload = json.loads(timed("AES decryption", aes_decrypt, read("encrypted", filename), key, read("iv", filename)))
+    key = timed(ALGORITHMS["key"] + " key decryption", rsa_decrypt_key, read("encrypted_key", filename))
+    payload = json.loads(timed(ALGORITHMS["encryption"] + " decryption", aes_decrypt, read("encrypted", filename), key, read("iv", filename)))
     record = normalize_record(payload["record"])
     serialized = json.dumps(record, sort_keys=True, ensure_ascii=False)
     computed_hash = timed("Hashing", hash_message, serialized)
@@ -587,8 +738,8 @@ def check_record(record_id):
     datetime.strptime(timestamp, TIME_FORMAT)
     settings = read("keys", "settings.json")
     valid_time = settings["start"] <= timestamp <= settings["deadline"] and timestamp <= now()
-    details = {"Record ID": record_id, "Stored SHA-512": stored_hash, "Computed SHA-512": computed_hash,
-               "Hash comparison": "MATCH" if hash_valid else "MISMATCH", "ElGamal signature": signature,
+    details = {"Record ID": record_id, "Stored " + ALGORITHMS["hash"]: stored_hash, "Computed " + ALGORITHMS["hash"]: computed_hash,
+               "Hash comparison": "MATCH" if hash_valid else "MISMATCH", ALGORITHMS["signature"] + " signature": signature,
                "Expected verification value": expected, "Actual verification value": actual,
                "Signature comparison": "MATCH" if signature_valid else "MISMATCH", "Timestamp valid": valid_time}
     if not (hash_valid and signature_valid and valid_time):
@@ -604,7 +755,7 @@ def check_record(record_id):
             raise ValueError("Invalid Paillier randomness.")
         if encrypted[name] != pow(n + 1, value, n*n) * pow(r, n, n*n) % (n*n):
             raise ValueError("Encrypted total does not match the signed record.")
-    if read("index", filename) != make_index(record, timestamp):
+    if not indexes_match(read("index", filename), make_index(record, timestamp)):
         raise ValueError("Search index mismatch.")
     return record, details
 
@@ -661,7 +812,7 @@ def find_records(field_name=None, query=None, start=None, end=None):
     for file in sorted((BASE / "index").glob("*.json")):
         if not valid_receipt(file.name):
             continue
-        if read("index", file.name).get(index_field) not in tokens:
+        if stored_search_token(read("index", file.name).get(index_field)) not in tokens:
             continue
         if field_name is None:
             timestamp = datetime.strptime(read("metadata", file.name)["submitted_at"], TIME_FORMAT)
