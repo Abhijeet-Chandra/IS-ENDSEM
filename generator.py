@@ -718,13 +718,15 @@ def make_metrics(domain):
     return metrics
 
 
-def build_domain_source(domain, entities):
+def build_domain_source(domain, entities, algorithms=None):
+    algorithms = validate_algorithms(algorithms)
     domain = validate_domain(domain)
     entities = validate_entities(entities, DOMAIN_ACTIONS)
     tree = ast.parse(TEMPLATE)
     first_function = next(n for n in tree.body if isinstance(n,ast.FunctionDef))
     header = ''.join(TEMPLATE.splitlines(keepends=True)[:first_function.lineno-1])
     header = header.replace('election_files','record_files').replace('CANDIDATES = [1, 2, 3]','')
+    header += '\nALGORITHMS = '+repr(algorithms)+'\n'
     header += '\nDOMAIN = '+repr(domain)+'\nENTITIES = '+repr(entities)+'\n'
     header += 'DOMAIN_ACTIONS = '+repr(DOMAIN_ACTIONS)+'\nMETRICS = '+repr(make_metrics(domain))+'\n\n'
     keep = {'now','save','read','timed','show_summary','password_key','new_password','login',
@@ -745,18 +747,29 @@ def build_domain_source(domain, entities):
                     text=text[:start]+'    start = datetime(1970, 1, 1)\n    deadline = datetime(9999, 12, 31, 23, 59, 59)\n\n'+text[end:]
                 text=text.replace('    if any((BASE / folder).iterdir() for folder in []):\n        pass\n\n','')
             parts.append(text+'\n\n')
-    parts.append(DOMAIN_RUNTIME)
+    parts.append(ALGORITHM_RUNTIME)
+    runtime = DOMAIN_RUNTIME.replace('key = os.urandom(32)', 'key = document_key()')
+    runtime = runtime.replace('"AES encryption"', 'ALGORITHMS["encryption"] + " encryption"').replace('"AES decryption"', 'ALGORITHMS["encryption"] + " decryption"')
+    runtime = runtime.replace('"RSA key encryption"', 'ALGORITHMS["key"] + " key encryption"').replace('"RSA key decryption"', 'ALGORITHMS["key"] + " key decryption"')
+    for old, new in [('"SHA-512"', 'ALGORITHMS["hash"]'), ('"Stored SHA-512"', '"Stored " + ALGORITHMS["hash"]'), ('"Computed SHA-512"', '"Computed " + ALGORITHMS["hash"]'), ('"ElGamal signature"', 'ALGORITHMS["signature"] + " signature"'), ('"AES ciphertext"', 'ALGORITHMS["encryption"] + " ciphertext"'), ('"RSA-wrapped key"', 'ALGORITHMS["key"] + "-wrapped key"')]:
+        runtime = runtime.replace(old, new)
+    runtime = runtime.replace('search_token(field["name"]', 'index_token(field["name"]').replace('search_token("minute:" + timestamp[:16])', 'index_token("minute:" + timestamp[:16])')
+    runtime = runtime.replace('read("index", filename) != make_index(record, timestamp)', 'not indexes_match(read("index", filename), make_index(record, timestamp))')
+    runtime = runtime.replace('read("index", file.name).get(index_field) not in tokens', 'stored_search_token(read("index", file.name).get(index_field)) not in tokens')
+    parts.append(runtime)
     source=''.join(parts)
     ast.parse(source)
     return source,domain,entities
 
 
-def create_domain_solution(domain, entities, output_dir):
-    source,domain,entities = build_domain_source(domain,entities)
+def create_domain_solution(domain, entities, output_dir, algorithms=None):
+    algorithms = validate_algorithms(algorithms)
+    source,domain,entities = build_domain_source(domain,entities,algorithms)
     directory = Path(output_dir).resolve()
     directory.mkdir(parents=True,exist_ok=False)
     artifacts={
         'solution.py':source,
+        'algorithms.json':json.dumps(algorithms,indent=2),
         'domain.json':json.dumps(domain,indent=2,ensure_ascii=False),
         'entities.json':json.dumps(entities,indent=2,ensure_ascii=False),
         'requirements.txt':'pycryptodome\n',
@@ -785,9 +798,13 @@ Time search uses the original minute-token index and exact timestamp filtering;
 queries can span at most seven days. Search reveals IDs, not record contents.
 
 CRYPTO AND STORAGE
-SHA-512, AES-256-CBC, RSA-4096 key wrapping, ElGamal signatures, Paillier sums,
-HMAC-SHA256 search tokens, passwords, timestamp receipts and two-authority
-aggregate decryption retain the voting example's design. No sockets.
+Selected algorithms: {json.dumps(algorithms)}. See algorithms.json.
+Paillier totals, passwords, receipts and two-authority aggregate decryption
+retain the original design. No sockets. RSA signatures use PKCS#1 v1.5 with
+SHA-256 over the selected document digest; Schnorr uses a SHA-256 challenge.
+SSE uses HMAC-SHA256 tokens. PKSE lab mode encrypts keyword hashes with RSA-OAEP
+and scans using the private search key; it is not trapdoor-based PEKS.
+DES, Triple-DES, MD5 and SHA-1 are provided for legacy lab exercises.
 Records are stored under record_files/ in the original separate-file layout.
 Every submitted record must be verified before aggregating. Minimum aggregate
 size: {domain['min_records']}. Close submissions on aggregation: {domain['close_on_aggregate']}.
@@ -878,6 +895,7 @@ def main():
     print('Configure your fields, searchable values, encrypted totals/counts and entity workflows.')
     print('Original crypto suite: AES-256, RSA-4096, SHA-512, ElGamal, Paillier and SSE.')
     domain=choose_domain()
+    algorithms=choose_algorithms()
     entities=choose_entities(DOMAIN_ACTIONS)
     print('\nSystem:',domain['title'])
     print('Record:',domain['record_name'])
@@ -890,7 +908,7 @@ def main():
     while True:
         answer=input(f'NEW output folder (Enter for {default}): ').strip()
         try:
-            file=create_domain_solution(domain,entities,Path(answer).expanduser() if answer else default)
+            file=create_domain_solution(domain,entities,Path(answer).expanduser() if answer else default, algorithms=algorithms)
             break
         except FileExistsError:
             print('Folder exists. Choose a new folder to preserve its records and keys.')
@@ -899,6 +917,202 @@ def main():
     print('Created:',file)
     print('Open its folder and run python solution.py')
 
+
+
+ALGORITHM_CHOICES = {
+    'encryption': ['AES-256', 'AES-128', 'AES-192', 'DES', 'Triple-DES'],
+    'hash': ['SHA-512', 'SHA-256', 'SHA-1', 'MD5'],
+    'key': ['RSA', 'ECDH'],
+    'signature': ['ElGamal', 'RSA', 'Schnorr'],
+    'search': ['SSE', 'PKSE'],
+}
+
+
+def validate_algorithms(algorithms=None):
+    supplied = {} if algorithms is None else algorithms
+    if not isinstance(supplied, dict) or set(supplied) - set(ALGORITHM_CHOICES):
+        raise ValueError('Unknown algorithm category.')
+    result = {}
+    for category, choices in ALGORITHM_CHOICES.items():
+        value = supplied.get(category, choices[0])
+        normalized = str(value).lower().replace('-', '').replace('_', '').replace(' ', '')
+        matches = [choice for choice in choices if choice.lower().replace('-', '') == normalized]
+        if not matches:
+            raise ValueError('Unsupported ' + category + ': ' + str(value))
+        result[category] = matches[0]
+    return result
+
+
+def choose_algorithms():
+    print('\nCHOOSE CRYPTO ALGORITHMS (Enter keeps the original default)')
+    selected = {}
+    for category, choices in ALGORITHM_CHOICES.items():
+        print(category.title() + ': ' + ', '.join(f'{i}. {name}' for i, name in enumerate(choices, 1)))
+        while True:
+            answer = input(f'{category.title()} algorithm [{choices[0]}]: ').strip()
+            if answer.isdigit() and 1 <= int(answer) <= len(choices):
+                answer = choices[int(answer)-1]
+            try:
+                selected[category] = validate_algorithms({category: answer or choices[0]})[category]
+                break
+            except ValueError as error:
+                print(error)
+    print('Homomorphic totals: Paillier (required for sums and two-authority decryption).')
+    if selected['search'] == 'PKSE':
+        print('PKSE lab mode: RSA-encrypted keyword hashes; private-key scan, not trapdoor PEKS.')
+    return selected
+
+
+ALGORITHM_RUNTIME = r"""
+from Crypto.Cipher import DES, DES3
+from Crypto.PublicKey import ECC, DSA
+from Crypto.Protocol.DH import key_agreement
+from Crypto.Signature import pkcs1_15
+
+_original_setup = setup
+_original_generate_signing_keys = generate_signing_keys
+_original_sign_hash = sign_hash
+_original_signature_values = signature_values
+_original_encrypt_key = rsa_encrypt_key
+_original_decrypt_key = rsa_decrypt_key
+_original_search_token = search_token
+
+
+def setup():
+    _original_setup()
+    if ALGORITHMS['key'] == 'ECDH' and not (BASE/'keys'/'ecdh_private.json').exists():
+        key = ECC.generate(curve='P-256')
+        save('keys', 'ecdh_private.json', key.export_key(format='PEM'))
+        save('keys', 'ecdh_public.json', key.public_key().export_key(format='PEM'))
+    if ALGORITHMS['signature'] == 'Schnorr' and not (BASE/'keys'/'schnorr.json').exists():
+        group = DSA.generate(2048)
+        save('keys', 'schnorr.json', {name: int(getattr(group, name)) for name in ('p','q','g')})
+    if ALGORITHMS['search'] == 'PKSE' and not (BASE/'keys'/'search_private.json').exists():
+        key = RSA.generate(2048)
+        save('keys', 'search_private.json', key.export_key().decode())
+        save('keys', 'search_public.json', key.publickey().export_key().decode())
+
+
+def document_key():
+    size = {'AES-128':16, 'AES-192':24, 'AES-256':32, 'DES':8, 'Triple-DES':24}[ALGORITHMS['encryption']]
+    key = os.urandom(size)
+    return DES3.adjust_key_parity(key) if ALGORITHMS['encryption'] == 'Triple-DES' else key
+
+
+def document_cipher():
+    return {'DES':DES, 'Triple-DES':DES3}.get(ALGORITHMS['encryption'], AES)
+
+
+def aes_encrypt(plaintext, key):
+    algorithm = document_cipher()
+    cipher = algorithm.new(key, algorithm.MODE_CBC)
+    return cipher.iv.hex(), cipher.encrypt(pad(plaintext.encode(), algorithm.block_size)).hex()
+
+
+def aes_decrypt(ciphertext, key, iv):
+    algorithm = document_cipher()
+    cipher = algorithm.new(key, algorithm.MODE_CBC, iv=bytes.fromhex(iv))
+    return unpad(cipher.decrypt(bytes.fromhex(ciphertext)), algorithm.block_size).decode()
+
+
+def hash_message(message):
+    return hashlib.new(ALGORITHMS['hash'].lower().replace('-', ''), message.encode()).hexdigest()
+
+
+def rsa_encrypt_key(key):
+    if ALGORITHMS['key'] == 'RSA':
+        return _original_encrypt_key(key)
+    ephemeral = ECC.generate(curve='P-256')
+    public = ECC.import_key(read('keys', 'ecdh_public.json'))
+    secret = key_agreement(eph_priv=ephemeral, static_pub=public, kdf=lambda x: SHA256.new(x).digest())
+    cipher = AES.new(secret, AES.MODE_EAX)
+    ciphertext, tag = cipher.encrypt_and_digest(key)
+    return {'public':ephemeral.public_key().export_key(format='PEM'), 'nonce':cipher.nonce.hex(),
+            'tag':tag.hex(), 'ciphertext':ciphertext.hex()}
+
+
+def rsa_decrypt_key(ciphertext):
+    if ALGORITHMS['key'] == 'RSA':
+        return _original_decrypt_key(ciphertext)
+    private = ECC.import_key(read('keys','ecdh_private.json'))
+    public = ECC.import_key(ciphertext['public'])
+    secret = key_agreement(static_priv=private, eph_pub=public, kdf=lambda x: SHA256.new(x).digest())
+    cipher = AES.new(secret, AES.MODE_EAX, nonce=bytes.fromhex(ciphertext['nonce']))
+    return cipher.decrypt_and_verify(bytes.fromhex(ciphertext['ciphertext']), bytes.fromhex(ciphertext['tag']))
+
+
+def generate_signing_keys():
+    if ALGORITHMS['signature'] == 'ElGamal':
+        return _original_generate_signing_keys()
+    if ALGORITHMS['signature'] == 'RSA':
+        key = RSA.generate(2048)
+        return key.export_key(), {'pem':key.publickey().export_key().decode()}
+    group = read('keys','schnorr.json')
+    private = secrets.randbelow(group['q']-1)+1
+    return private, {**group, 'y':pow(group['g'],private,group['p'])}
+
+
+def schnorr_challenge(digest, commitment, public):
+    message = json.dumps([digest, commitment, public['p'], public['q'], public['g'], public['y']], separators=(',', ':'))
+    return int.from_bytes(hashlib.sha256(message.encode()).digest(), 'big') % public['q']
+
+
+def sign_hash(digest, private, public):
+    if ALGORITHMS['signature'] == 'ElGamal':
+        return _original_sign_hash(digest, private, public)
+    if ALGORITHMS['signature'] == 'RSA':
+        return pkcs1_15.new(RSA.import_key(private)).sign(SHA256.new(bytes.fromhex(digest))).hex()
+    nonce = secrets.randbelow(public['q']-1)+1
+    commitment = pow(public['g'],nonce,public['p'])
+    challenge = schnorr_challenge(digest,commitment,public)
+    return [challenge, (nonce+private*challenge) % public['q']]
+
+
+def signature_values(digest, signature, public):
+    if ALGORITHMS['signature'] == 'ElGamal':
+        return _original_signature_values(digest, signature, public)
+    if ALGORITHMS['signature'] == 'RSA':
+        key = RSA.import_key(public['pem'])
+        # PKCS#1 v1.5 SHA-256 DigestInfo, signing the selected document digest.
+        info = bytes.fromhex('3031300d060960864801650304020105000420') + SHA256.new(bytes.fromhex(digest)).digest()
+        size = key.size_in_bytes()
+        expected = b'\x00\x01' + b'\xff'*(size-len(info)-3) + b'\x00' + info
+        data = bytes.fromhex(signature)
+        value = int.from_bytes(data,'big')
+        if len(data) != size or value >= key.n:
+            return expected.hex(), 'INVALID SIGNATURE'
+        return expected.hex(), pow(value,key.e,key.n).to_bytes(size,'big').hex()
+    challenge, response = signature
+    if not (0 <= challenge < public['q'] and 0 <= response < public['q']):
+        return 'VALID RANGE', 'INVALID SIGNATURE'
+    commitment = pow(public['g'],response,public['p']) * pow(pow(public['y'],challenge,public['p']),-1,public['p']) % public['p']
+    return challenge, schnorr_challenge(digest,commitment,public)
+
+
+def search_token(value):
+    if ALGORITHMS['search'] == 'SSE':
+        return _original_search_token(value)
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def index_token(value):
+    token = search_token(value)
+    if ALGORITHMS['search'] == 'SSE':
+        return token
+    public = RSA.import_key(read('keys','search_public.json'))
+    return PKCS1_OAEP.new(public,hashAlgo=SHA256).encrypt(bytes.fromhex(token)).hex()
+
+
+def stored_search_token(token):
+    if ALGORITHMS['search'] == 'SSE':
+        return token
+    private = RSA.import_key(read('keys','search_private.json'))
+    return PKCS1_OAEP.new(private,hashAlgo=SHA256).decrypt(bytes.fromhex(token)).hex()
+
+
+def indexes_match(stored, expected):
+    return set(stored) == set(expected) and all(hmac.compare_digest(stored_search_token(stored[k]), stored_search_token(expected[k])) for k in stored)
+"""
 
 if __name__=='__main__':
     try:

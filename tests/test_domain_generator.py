@@ -121,7 +121,7 @@ class DomainGeneratorTests(unittest.TestCase):
             copy=Path(temp)/'generator.py';copy.write_bytes((ROOT/'generator.py').read_bytes())
             out=Path(temp)/'result'
             answers='\n'.join(['Warehouse','item','2','category','choice','Tools,Parts','y','y',
-                                'quantity','integer','n','y','n','n','','2','Supplier','1','Manager','2,5,6',str(out),''])
+                                'quantity','integer','n','y','n','n','','','','','','','2','Supplier','1','Manager','2,5,6',str(out),''])
             run=subprocess.run([sys.executable,str(copy)],input=answers,text=True,capture_output=True,timeout=30)
             self.assertEqual(run.returncode,0,run.stderr)
             self.assertTrue((out/'solution.py').exists(),run.stdout)
