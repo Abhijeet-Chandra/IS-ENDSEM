@@ -741,6 +741,13 @@ def build_domain_source(domain, entities, algorithms=None):
                 text=text.replace('for role in ("voter", "server", "tally"):', 'for role in ENTITIES:')
                 text=text.replace('election_files','record_files').replace('FIRST-RUN ELECTION SETUP','FIRST-RUN SYSTEM SETUP')
                 text=text.replace('Voting starts:','Submissions start:').replace('Voting deadline:','Submission deadline:')
+                rsa_start = text.index('    print("Generating RSA-4096 keys...")')
+                rsa_end = text.index('    print("Generating Paillier parameters...")', rsa_start)
+                rsa_setup = text[rsa_start:rsa_end]
+                rsa_setup = rsa_setup.replace('print("Generating RSA-4096 keys...")', 'print("Generating RSA-" + str(ALGORITHMS["rsa_bits"]["key"]) + " keys...")')
+                rsa_setup = rsa_setup.replace('RSA.generate(4096)', 'RSA.generate(ALGORITHMS["rsa_bits"]["key"])')
+                text = text[:rsa_start] + '    if ALGORITHMS["key"] == "RSA":\n' + ''.join('    '+line if line.strip() else line for line in rsa_setup.splitlines(keepends=True)) + text[rsa_end:]
+
                 if not domain['use_deadline']:
                     start=text.index('    start = datetime.strptime(')
                     end=text.index('    accounts = {}',start)
@@ -799,6 +806,8 @@ queries can span at most seven days. Search reveals IDs, not record contents.
 
 CRYPTO AND STORAGE
 Selected algorithms: {json.dumps(algorithms)}. See algorithms.json.
+RSA sizes are configured separately for key protection, signatures and PKSE search.
+Only selected RSA uses generate keys; restarting reuses stored wrapping/search keys.
 Paillier totals, passwords, receipts and two-authority aggregate decryption
 retain the original design. No sockets. RSA signatures use PKCS#1 v1.5 with
 SHA-256 over the selected document digest; Schnorr uses a SHA-256 challenge.
@@ -928,9 +937,13 @@ ALGORITHM_CHOICES = {
 }
 
 
+RSA_KEY_SIZES = (2048, 3072, 4096)
+RSA_DEFAULT_BITS = {'key':4096, 'signature':2048, 'search':2048}
+
+
 def validate_algorithms(algorithms=None):
     supplied = {} if algorithms is None else algorithms
-    if not isinstance(supplied, dict) or set(supplied) - set(ALGORITHM_CHOICES):
+    if not isinstance(supplied, dict) or set(supplied) - (set(ALGORITHM_CHOICES) | {'rsa_bits'}):
         raise ValueError('Unknown algorithm category.')
     result = {}
     for category, choices in ALGORITHM_CHOICES.items():
@@ -940,12 +953,20 @@ def validate_algorithms(algorithms=None):
         if not matches:
             raise ValueError('Unsupported ' + category + ': ' + str(value))
         result[category] = matches[0]
+    sizes = supplied.get('rsa_bits', {})
+    if not isinstance(sizes, dict) or set(sizes) - set(RSA_DEFAULT_BITS):
+        raise ValueError('RSA sizes must specify key, signature, or search.')
+    result['rsa_bits'] = dict(RSA_DEFAULT_BITS)
+    for purpose, bits in sizes.items():
+        if type(bits) is not int or bits not in RSA_KEY_SIZES:
+            raise ValueError('RSA key size must be 2048, 3072, or 4096 bits.')
+        result['rsa_bits'][purpose] = bits
     return result
 
 
 def choose_algorithms():
     print('\nCHOOSE CRYPTO ALGORITHMS (Enter keeps the original default)')
-    selected = {}
+    selected = {'rsa_bits': dict(RSA_DEFAULT_BITS)}
     for category, choices in ALGORITHM_CHOICES.items():
         print(category.title() + ': ' + ', '.join(f'{i}. {name}' for i, name in enumerate(choices, 1)))
         while True:
@@ -957,6 +978,16 @@ def choose_algorithms():
                 break
             except ValueError as error:
                 print(error)
+        if (category in ('key', 'signature') and selected[category] == 'RSA') or (category == 'search' and selected[category] == 'PKSE'):
+            label = {'key':'key protection', 'signature':'digital signatures', 'search':'PKSE search'}[category]
+            while True:
+                answer = input(f'RSA bits for {label}: 2048 / 3072 / 4096 [{RSA_DEFAULT_BITS[category]}]: ').strip()
+                if not answer:
+                    break
+                if answer.isdigit() and int(answer) in RSA_KEY_SIZES:
+                    selected['rsa_bits'][category] = int(answer)
+                    break
+                print('Enter 2048, 3072, or 4096, or press Enter for the default.')
     print('Homomorphic totals: Paillier (required for sums and two-authority decryption).')
     if selected['search'] == 'PKSE':
         print('PKSE lab mode: RSA-encrypted keyword hashes; private-key scan, not trapdoor PEKS.')
@@ -988,7 +1019,7 @@ def setup():
         group = DSA.generate(2048)
         save('keys', 'schnorr.json', {name: int(getattr(group, name)) for name in ('p','q','g')})
     if ALGORITHMS['search'] == 'PKSE' and not (BASE/'keys'/'search_private.json').exists():
-        key = RSA.generate(2048)
+        key = RSA.generate(ALGORITHMS['rsa_bits']['search'])
         save('keys', 'search_private.json', key.export_key().decode())
         save('keys', 'search_public.json', key.publickey().export_key().decode())
 
@@ -1045,7 +1076,7 @@ def generate_signing_keys():
     if ALGORITHMS['signature'] == 'ElGamal':
         return _original_generate_signing_keys()
     if ALGORITHMS['signature'] == 'RSA':
-        key = RSA.generate(2048)
+        key = RSA.generate(ALGORITHMS['rsa_bits']['signature'])
         return key.export_key(), {'pem':key.publickey().export_key().decode()}
     group = read('keys','schnorr.json')
     private = secrets.randbelow(group['q']-1)+1

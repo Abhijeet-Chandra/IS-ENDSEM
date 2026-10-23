@@ -36,3 +36,9 @@ cd D:\IS-ENDSEM
 WITHOUT ACTIVATING
 You can also use the virtual environment directly:
 D:\IS-ENDSEM\.venv\Scripts\python.exe D:\IS-ENDSEM\generator.py
+
+
+
+python -m venv name
+source ./name/bin/activate
+deactivate
