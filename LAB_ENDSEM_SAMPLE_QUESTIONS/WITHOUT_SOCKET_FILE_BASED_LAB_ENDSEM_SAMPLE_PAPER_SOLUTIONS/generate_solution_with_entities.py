@@ -493,318 +493,7 @@ def input(prompt=""):
     return builtins.input("[" + timestamp() + "] " + prompt)
 
 
-RUNTIME = r'''
-from datetime import datetime
-from time import perf_counter_ns
-import builtins
-
-CURRENT_ENTITY = "SYSTEM"
-CURRENT_FILE = None
-TIMINGS = []
-
-
-def timestamp():
-    return datetime.now().astimezone().isoformat(timespec="milliseconds")
-
-
-def print(*args, **kwargs):
-    text = kwargs.pop("sep", " ").join(str(arg) for arg in args)
-    for line in text.split("\n"):
-        builtins.print("[" + timestamp() + "] " + line, **kwargs)
-
-
-def input(prompt=""):
-    return builtins.input("[" + timestamp() + "] " + prompt)
-
-
-def record_path(relative):
-    candidate = (BASE / relative).resolve()
-    if not candidate.is_relative_to(BASE.resolve()):
-        raise ValueError("Path must stay within this solution folder.")
-    return candidate
-
-
-def validate_filename(filename):
-    if (not filename or filename in (".", "..") or
-            any(ch in filename for ch in '<>:"/\\|?*') or
-            any(ord(ch) < 32 for ch in filename) or
-            filename.endswith((".", " ")) or
-            filename.split('.')[0].upper() in
-            {"CON", "PRN", "AUX", "NUL", *[f"COM{i}" for i in range(1, 10)],
-             *[f"LPT{i}" for i in range(1, 10)]}):
-        raise ValueError("Enter a plain filename, for example report1.txt")
-    return filename
-
-
-def read_record(relative):
-    return json.loads(record_path(relative).read_text(encoding="utf-8"))["data"]
-
-
-def save_record(relative, data):
-    file = record_path(relative)
-    file.parent.mkdir(parents=True, exist_ok=True)
-    now = timestamp()
-    created_at = now
-    if file.exists():
-        created_at = json.loads(file.read_text(encoding="utf-8"))["created_at"]
-    envelope = {"created_at": created_at, "updated_at": now,
-                "entity": CURRENT_ENTITY, "timings": list(TIMINGS), "data": data}
-    file.write_text(json.dumps(envelope, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
-def record_event(event):
-    BASE.mkdir(parents=True, exist_ok=True)
-    with (BASE / "audit.jsonl").open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(event, ensure_ascii=False) + "\n")
-
-
-def timed(operation, function, *args, **kwargs):
-    started_at = timestamp()
-    started = perf_counter_ns()
-    status = "success"
-    try:
-        result = function(*args, **kwargs)
-        if result is False:
-            status = "failed"
-        return result
-    except Exception:
-        status = "error"
-        raise
-    finally:
-        duration = (perf_counter_ns() - started) / 1_000_000
-        event = {"started_at": started_at, "finished_at": timestamp(),
-                 "entity": CURRENT_ENTITY, "filename": CURRENT_FILE,
-                 "operation": operation, "status": status, "duration_ms": duration}
-        TIMINGS.append(event)
-        record_event(event)
-        print(f"{operation}: {duration:.6f} ms ({status})")
-
-
-def initialize():
-    global SERVER_RSA, SERVER_ECC, PRIVATE_X, PUBLIC_Y, KEY, SEARCH_KEY
-    for name in ("encrypted", "hashes", "signature", "public_key", "add", "metadata", "keys", "verification"):
-        (BASE / name).mkdir(parents=True, exist_ok=True)
-    if record_path("keys/local.json").exists():
-        state = read_record("keys/local.json")
-    else:
-        state = {"symmetric": get_random_bytes(KEY_BYTES).hex(),
-                 "search": get_random_bytes(32).hex()}
-        if ASYMMETRIC == "RSA":
-            state["private"] = timed("key_generation", RSA.generate, 2048).export_key().decode()
-        elif ASYMMETRIC == "ECDH":
-            state["private"] = timed("key_generation", ECC.generate, curve="P-256").export_key(format="PEM")
-        else:
-            state["private"] = secrets.randbelow(P - 3) + 2
-        save_record("keys/local.json", state)
-    if ASYMMETRIC == "RSA":
-        SERVER_RSA = RSA.import_key(state["private"])
-    elif ASYMMETRIC == "ECDH":
-        SERVER_ECC = ECC.import_key(state["private"])
-    else:
-        PRIVATE_X = state["private"]
-        PUBLIC_Y = pow(G, PRIVATE_X, P)
-    KEY = bytes.fromhex(state["symmetric"])
-    SEARCH_KEY = bytes.fromhex(state["search"])
-    return KEY, SEARCH_KEY
-
-
-def ciphertext(filename):
-    return read_record("encrypted/" + filename)
-
-
-def decrypt_record(filename):
-    metadata = read_record("metadata/" + filename)
-    return symmetric_decrypt(ciphertext(filename), KEY, bytes.fromhex(metadata["iv"]))
-
-
-def require_permission(entity, action):
-    if entity not in ENTITIES or action not in ENTITIES[entity]:
-        raise PermissionError(f"{entity} is not allowed to perform {action}.")
-    if action == "build_index" and "decrypt" not in ENTITIES[entity]:
-        raise PermissionError("Building the index also requires decrypt permission.")
-
-
-def perform(entity, action, filename=None, **values):
-    global CURRENT_ENTITY, CURRENT_FILE, TIMINGS
-    CURRENT_ENTITY, CURRENT_FILE, TIMINGS = entity, filename, []
-    started_at, started = timestamp(), perf_counter_ns()
-    status = "success"
-    try:
-        require_permission(entity, action)
-        if action not in ("list", "build_index", "search"):
-            filename = validate_filename(filename or "")
-        if action == "encrypt":
-            if record_path("encrypted/" + filename).exists():
-                raise ValueError("Document already exists.")
-            iv = get_random_bytes(BLOCK_CIPHER.block_size)
-            encrypted = timed("encryption", symmetric_encrypt, values["plaintext"], KEY, iv)
-            save_record("encrypted/" + filename, encrypted)
-            save_record("metadata/" + filename, {"iv": iv.hex()})
-            # An existing index is now stale; a permitted entity must rebuild it.
-            if record_path("index.json").exists():
-                save_record("index_status.json", {"stale": True})
-            print("Document encrypted:", filename)
-            return filename
-        if action == "decrypt":
-            plaintext = timed("decryption", decrypt_record, filename)
-            print("Plaintext:")
-            print(plaintext)
-            return plaintext
-        if action == "hash":
-            digest = timed("hashing", digest_text, ciphertext(filename))
-            save_record("hashes/" + filename, digest)
-            print("Hash:", digest)
-            return digest
-        if action == "verify_hash":
-            digest = timed("hashing", digest_text, ciphertext(filename))
-            result = timed("hash_verification", hmac.compare_digest, digest, read_record("hashes/" + filename))
-            save_record("verification/hash_" + filename, {"verified": result})
-            print("Hash verified:", result)
-            if not result:
-                status = "failed"
-            return result
-        if action == "sign":
-            private_key, public_key = timed("signature_key_generation", generate_keys)
-            # sign_message keeps the original signature API; its digest is not
-            # saved here, because hashing is an independently assigned action.
-            signature, _ = timed("signature_generation", sign_message, ciphertext(filename), private_key)
-            save_record("signature/" + filename, signature)
-            save_record("public_key/" + filename, public_key)
-            print("Document signed:", filename)
-            return signature
-        if action == "verify_signature":
-            result = timed("signature_verification", verify_signature, ciphertext(filename),
-                           read_record("signature/" + filename), read_record("public_key/" + filename))
-            save_record("verification/signature_" + filename, {"verified": result})
-            print("Signature verified:", result)
-            if not result:
-                status = "failed"
-            return result
-        if action == "key_encrypt":
-            metadata = read_record("metadata/" + filename)
-            metadata["wrapped_key"] = timed("key_encryption", wrap_key, KEY)
-            save_record("metadata/" + filename, metadata)
-            print("Document key protected.")
-            return True
-        if action == "key_decrypt":
-            metadata = read_record("metadata/" + filename)
-            recovered = timed("key_decryption", unwrap_key, metadata["wrapped_key"])
-            result = hmac.compare_digest(recovered, KEY)
-            save_record("verification/key_" + filename, {"verified": result})
-            print("Recovered key matches:", result)
-            if not result:
-                status = "failed"
-            return result
-        if action == "homomorphic_encrypt":
-            ciphertext(filename)  # Require an existing document.
-            a, b = values["num1"], values["num2"]
-            result = timed("homomorphic_encryption_and_combination", calculate_homomorphic, a, b)
-            result.update(num1=a, num2=b)
-            save_record("add/" + filename, result)
-            print("Encrypted", result["operation"], ":", result["ciphertext"])
-            return result
-        if action == "homomorphic_decrypt":
-            saved = read_record("add/" + filename)
-            result = timed("homomorphic_decryption", decrypt_homomorphic, saved["ciphertext"])
-            valid = result == expected_homomorphic(saved["num1"], saved["num2"])
-            save_record("verification/homomorphic_" + filename, {"result": result, "verified": valid})
-            print("Homomorphic result:", result, "verified:", valid)
-            if not valid:
-                status = "failed"
-            return result
-        if action == "build_index":
-            documents = {}
-            for file in sorted((BASE / "encrypted").iterdir()):
-                if file.is_file():
-                    documents[file.name] = timed("index_document_decryption", decrypt_record, file.name)
-            index = timed("index_creation", create_index, documents, KEY)
-            save_record("index.json", index)
-            save_record("index_status.json", {"stale": False})
-            print("Search index created for", len(documents), "documents.")
-            return len(documents)
-        if action == "search":
-            if record_path("index_status.json").exists() and read_record("index_status.json")["stale"]:
-                raise ValueError("The index is stale. Ask an entity with build_index permission to rebuild it.")
-            query = values["query"].strip()
-            if len(query.split()) != 1:
-                raise ValueError("Enter one search word.")
-            results = timed("search", search, read_record("index.json"), query, KEY)
-            print("Matching filenames:", ", ".join(results) if results else "None")
-            return results
-        if action == "list":
-            results = sorted(file.name for file in (BASE / "encrypted").iterdir() if file.is_file())
-            print("Stored filenames:", ", ".join(results) if results else "None")
-            return results
-        raise ValueError("Unknown action.")
-    except PermissionError:
-        status = "denied"
-        raise
-    except Exception:
-        status = "error"
-        raise
-    finally:
-        event = {"started_at": started_at, "finished_at": timestamp(), "entity": entity,
-                 "filename": filename, "operation": "action:" + action, "status": status,
-                 "duration_ms": (perf_counter_ns() - started) / 1_000_000}
-        record_event(event)
-        # Overall action duration includes file I/O; timed crypto entries measure
-        # just the named function. Store both, without plaintext or key values.
-        with (BASE / "timings.jsonl").open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps({**event, "steps": list(TIMINGS)}) + "\n")
-        CURRENT_ENTITY, CURRENT_FILE = "SYSTEM", None
-
-
-def main():
-    initialize()
-    names = list(ENTITIES)
-    while True:
-        print("\n" + TITLE)
-        print("Choose an entity (local lab role simulation):")
-        for number, name in enumerate(names, 1):
-            print(f"{number}. {name}")
-        print("0. Exit")
-        choice = input("Entity: ").strip()
-        if choice == "0":
-            break
-        if not choice.isdigit() or not 1 <= int(choice) <= len(names):
-            print("Invalid entity.")
-            continue
-        entity = names[int(choice) - 1]
-        allowed = [action for action in ACTIONS if action in ENTITIES[entity]]
-        while True:
-            print("\n" + entity + " menu")
-            for number, action in enumerate(allowed, 1):
-                print(f"{number}. {ACTIONS[action]}")
-            print("0. Back")
-            choice = input("Action: ").strip()
-            if choice == "0":
-                break
-            if not choice.isdigit() or not 1 <= int(choice) <= len(allowed):
-                print("Invalid action.")
-                continue
-            action = allowed[int(choice) - 1]
-            try:
-                filename, values = None, {}
-                if action not in ("list", "build_index", "search"):
-                    filename = input("Filename: ").strip()
-                if action == "encrypt":
-                    values["plaintext"] = input("Document text: ")
-                elif action == "homomorphic_encrypt":
-                    values["num1"] = int(input("First integer: "))
-                    values["num2"] = int(input("Second integer: "))
-                elif action == "search":
-                    values["query"] = input("Search word: ")
-                perform(entity, action, filename, **values)
-            except (ValueError, OSError, KeyError, TypeError, PermissionError) as exc:
-                print("Operation could not complete:", exc)
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except (KeyboardInterrupt, EOFError):
-        print("Program closed.")
-'''
+RUNTIME = '\nfrom datetime import datetime\nfrom time import perf_counter_ns\nimport builtins\n\nCURRENT_ENTITY = "SYSTEM"\nCURRENT_FILE = None\nTIMINGS = []\n\n\ndef timestamp():\n    return datetime.now().astimezone().isoformat(timespec="milliseconds")\n\n\ndef print(*args, **kwargs):\n    text = kwargs.pop("sep", " ").join(str(arg) for arg in args)\n    for line in text.split("\\n"):\n        builtins.print("[" + timestamp() + "] " + line, **kwargs)\n\n\ndef input(prompt=""):\n    return builtins.input("[" + timestamp() + "] " + prompt)\n\n\ndef record_path(relative):\n    candidate = (BASE / relative).resolve()\n    if not candidate.is_relative_to(BASE.resolve()):\n        raise ValueError("Path must stay within this solution folder.")\n    return candidate\n\n\ndef validate_filename(filename):\n    if (not filename or filename in (".", "..") or\n            any(ch in filename for ch in \'<>:"/\\\\|?*\') or\n            any(ord(ch) < 32 for ch in filename) or\n            filename.endswith((".", " ")) or\n            filename.split(\'.\')[0].upper() in\n            {"CON", "PRN", "AUX", "NUL", *[f"COM{i}" for i in range(1, 10)],\n             *[f"LPT{i}" for i in range(1, 10)]}):\n        raise ValueError("Enter a plain filename, for example report1.txt")\n    return filename\n\n\ndef read_record(relative):\n    return json.loads(record_path(relative).read_text(encoding="utf-8"))["data"]\n\n\ndef save_record(relative, data):\n    file = record_path(relative)\n    file.parent.mkdir(parents=True, exist_ok=True)\n    now = timestamp()\n    created_at = now\n    if file.exists():\n        created_at = json.loads(file.read_text(encoding="utf-8"))["created_at"]\n    envelope = {"created_at": created_at, "updated_at": now,\n                "entity": CURRENT_ENTITY, "timings": list(TIMINGS), "data": data}\n    file.write_text(json.dumps(envelope, indent=2, ensure_ascii=False), encoding="utf-8")\n\n\ndef record_event(event):\n    BASE.mkdir(parents=True, exist_ok=True)\n    with (BASE / "audit.jsonl").open("a", encoding="utf-8") as stream:\n        stream.write(json.dumps(event, ensure_ascii=False) + "\\n")\n\n\ndef timed(operation, function, *args, **kwargs):\n    started_at = timestamp()\n    started = perf_counter_ns()\n    status = "success"\n    try:\n        result = function(*args, **kwargs)\n        if result is False:\n            status = "failed"\n        return result\n    except Exception:\n        status = "error"\n        raise\n    finally:\n        duration = (perf_counter_ns() - started) / 1_000_000\n        event = {"started_at": started_at, "finished_at": timestamp(),\n                 "entity": CURRENT_ENTITY, "filename": CURRENT_FILE,\n                 "operation": operation, "status": status, "duration_ms": duration}\n        TIMINGS.append(event)\n        record_event(event)\n        print(f"{operation}: {duration:.6f} ms ({status})")\n\n\ndef initialize():\n    global SERVER_RSA, SERVER_ECC, PRIVATE_X, PUBLIC_Y, KEY, SEARCH_KEY\n    for name in ("encrypted", "hashes", "signature", "public_key", "add", "metadata", "keys", "verification"):\n        (BASE / name).mkdir(parents=True, exist_ok=True)\n    if record_path("keys/local.json").exists():\n        state = read_record("keys/local.json")\n    else:\n        state = {"symmetric": get_random_bytes(KEY_BYTES).hex(),\n                 "search": get_random_bytes(32).hex()}\n        if ASYMMETRIC == "RSA":\n            state["private"] = timed("key_generation", RSA.generate, 2048).export_key().decode()\n        elif ASYMMETRIC == "ECDH":\n            state["private"] = timed("key_generation", ECC.generate, curve="P-256").export_key(format="PEM")\n        else:\n            state["private"] = secrets.randbelow(P - 3) + 2\n        save_record("keys/local.json", state)\n    if ASYMMETRIC == "RSA":\n        SERVER_RSA = RSA.import_key(state["private"])\n    elif ASYMMETRIC == "ECDH":\n        SERVER_ECC = ECC.import_key(state["private"])\n    else:\n        PRIVATE_X = state["private"]\n        PUBLIC_Y = pow(G, PRIVATE_X, P)\n    KEY = bytes.fromhex(state["symmetric"])\n    SEARCH_KEY = bytes.fromhex(state["search"])\n    return KEY, SEARCH_KEY\n\n\ndef ciphertext(filename):\n    return read_record("encrypted/" + filename)\n\n\ndef decrypt_record(filename):\n    metadata = read_record("metadata/" + filename)\n    return symmetric_decrypt(ciphertext(filename), KEY, bytes.fromhex(metadata["iv"]))\n\n\ndef require_permission(entity, action):\n    if entity not in ENTITIES or action not in ENTITIES[entity]:\n        raise PermissionError(f"{entity} is not allowed to perform {action}.")\n    if action == "build_index" and "decrypt" not in ENTITIES[entity]:\n        raise PermissionError("Building the index also requires decrypt permission.")\n\n\ndef perform(entity, action, filename=None, **values):\n    global CURRENT_ENTITY, CURRENT_FILE, TIMINGS\n    CURRENT_ENTITY, CURRENT_FILE, TIMINGS = entity, filename, []\n    started_at, started = timestamp(), perf_counter_ns()\n    status = "success"\n    try:\n        require_permission(entity, action)\n        if action not in ("list", "build_index", "search"):\n            filename = validate_filename(filename or "")\n        if action == "encrypt":\n            if record_path("encrypted/" + filename).exists():\n                raise ValueError("Document already exists.")\n            iv = get_random_bytes(BLOCK_CIPHER.block_size)\n            encrypted = timed("encryption", symmetric_encrypt, values["plaintext"], KEY, iv)\n            save_record("encrypted/" + filename, encrypted)\n            save_record("metadata/" + filename, {"iv": iv.hex()})\n            # An existing index is now stale; a permitted entity must rebuild it.\n            if record_path("index.json").exists():\n                save_record("index_status.json", {"stale": True})\n            print("Document encrypted:", filename)\n            return filename\n        if action == "decrypt":\n            plaintext = timed("decryption", decrypt_record, filename)\n            print("Plaintext:")\n            print(plaintext)\n            return plaintext\n        if action == "hash":\n            digest = timed("hashing", digest_text, ciphertext(filename))\n            save_record("hashes/" + filename, digest)\n            print("Hash:", digest)\n            return digest\n        if action == "verify_hash":\n            digest = timed("hashing", digest_text, ciphertext(filename))\n            result = timed("hash_verification", hmac.compare_digest, digest, read_record("hashes/" + filename))\n            save_record("verification/hash_" + filename, {"verified": result})\n            print("Hash verified:", result)\n            if not result:\n                status = "failed"\n            return result\n        if action == "sign":\n            private_key, public_key = timed("signature_key_generation", generate_keys)\n            # sign_message keeps the original signature API; its digest is not\n            # saved here, because hashing is an independently assigned action.\n            signature, _ = timed("signature_generation", sign_message, ciphertext(filename), private_key)\n            save_record("signature/" + filename, signature)\n            save_record("public_key/" + filename, public_key)\n            print("Document signed:", filename)\n            return signature\n        if action == "verify_signature":\n            result = timed("signature_verification", verify_signature, ciphertext(filename),\n                           read_record("signature/" + filename), read_record("public_key/" + filename))\n            save_record("verification/signature_" + filename, {"verified": result})\n            print("Signature verified:", result)\n            if not result:\n                status = "failed"\n            return result\n        if action == "key_encrypt":\n            metadata = read_record("metadata/" + filename)\n            metadata["wrapped_key"] = timed("key_encryption", wrap_key, KEY)\n            save_record("metadata/" + filename, metadata)\n            print("Document key protected.")\n            return True\n        if action == "key_decrypt":\n            metadata = read_record("metadata/" + filename)\n            recovered = timed("key_decryption", unwrap_key, metadata["wrapped_key"])\n            result = hmac.compare_digest(recovered, KEY)\n            save_record("verification/key_" + filename, {"verified": result})\n            print("Recovered key matches:", result)\n            if not result:\n                status = "failed"\n            return result\n        if action == "homomorphic_encrypt":\n            ciphertext(filename)  # Require an existing document.\n            a, b = values["num1"], values["num2"]\n            result = timed("homomorphic_encryption_and_combination", calculate_homomorphic, a, b)\n            result.update(num1=a, num2=b)\n            save_record("add/" + filename, result)\n            print("Encrypted", result["operation"], ":", result["ciphertext"])\n            return result\n        if action == "homomorphic_decrypt":\n            saved = read_record("add/" + filename)\n            result = timed("homomorphic_decryption", decrypt_homomorphic, saved["ciphertext"])\n            valid = result == expected_homomorphic(saved["num1"], saved["num2"])\n            save_record("verification/homomorphic_" + filename, {"result": result, "verified": valid})\n            print("Homomorphic result:", result, "verified:", valid)\n            if not valid:\n                status = "failed"\n            return result\n        if action == "build_index":\n            documents = {}\n            for file in sorted((BASE / "encrypted").iterdir()):\n                if file.is_file():\n                    documents[file.name] = timed("index_document_decryption", decrypt_record, file.name)\n            index = timed("index_creation", create_index, documents, KEY)\n            save_record("index.json", index)\n            save_record("index_status.json", {"stale": False})\n            print("Search index created for", len(documents), "documents.")\n            return len(documents)\n        if action == "search":\n            if record_path("index_status.json").exists() and read_record("index_status.json")["stale"]:\n                raise ValueError("The index is stale. Ask an entity with build_index permission to rebuild it.")\n            query = values["query"].strip()\n            if len(query.split()) != 1:\n                raise ValueError("Enter one search word.")\n            results = timed("search", search, read_record("index.json"), query, KEY)\n            print("Matching filenames:", ", ".join(results) if results else "None")\n            return results\n        if action == "list":\n            results = sorted(file.name for file in (BASE / "encrypted").iterdir() if file.is_file())\n            print("Stored filenames:", ", ".join(results) if results else "None")\n            return results\n        raise ValueError("Unknown action.")\n    except PermissionError:\n        status = "denied"\n        raise\n    except Exception:\n        status = "error"\n        raise\n    finally:\n        event = {"started_at": started_at, "finished_at": timestamp(), "entity": entity,\n                 "filename": filename, "operation": "action:" + action, "status": status,\n                 "duration_ms": (perf_counter_ns() - started) / 1_000_000}\n        record_event(event)\n        # Overall action duration includes file I/O; timed crypto entries measure\n        # just the named function. Store both, without plaintext or key values.\n        with (BASE / "timings.jsonl").open("a", encoding="utf-8") as stream:\n            stream.write(json.dumps({**event, "steps": list(TIMINGS)}) + "\\n")\n        CURRENT_ENTITY, CURRENT_FILE = "SYSTEM", None\n\n\nWORKFLOW_ORDER = (\n    "encrypt", "key_encrypt", "hash", "sign", "verify_hash", "verify_signature",\n    "key_decrypt", "decrypt", "homomorphic_encrypt", "homomorphic_decrypt",\n    "build_index", "search", "list",\n)\n\n\ndef run_workflow(entity, filename=None, **values):\n    if entity not in ENTITIES:\n        raise PermissionError("Unknown entity.")\n    allowed = ENTITIES[entity]\n    report = {"completed": [], "skipped": [], "failed": []}\n    if any(action not in ("list", "build_index", "search") for action in allowed):\n        filename = validate_filename(filename or "")\n    for action in WORKFLOW_ORDER:\n        if action not in allowed:\n            continue\n        # Reusing a record must not overwrite the evidence to be verified.\n        existing = {"encrypt": "encrypted/", "hash": "hashes/", "sign": "signature/",\n                    "homomorphic_encrypt": "add/"}\n        if action in existing and record_path(existing[action] + filename).exists():\n            print("Already saved; reusing:", ACTIONS[action])\n            report["skipped"].append(action)\n            continue\n        if action == "key_encrypt" and record_path("metadata/" + filename).exists():\n            if "wrapped_key" in read_record("metadata/" + filename):\n                print("Already saved; reusing protected key.")\n                report["skipped"].append(action)\n                continue\n        try:\n            result = perform(entity, action, filename, **values)\n            if result is False:\n                print("Workflow stopped: verification failed. Remaining steps were not run.")\n                report["failed"].append(action)\n                break\n            if action == "homomorphic_decrypt":\n                saved = read_record("add/" + filename)\n                if result != expected_homomorphic(saved["num1"], saved["num2"]):\n                    print("Workflow stopped: homomorphic verification failed.")\n                    report["failed"].append(action)\n                    break\n            report["completed"].append(action)\n        except FileNotFoundError:\n            print("Not ready:", ACTIONS[action], "- a required record/artifact must be created by its permitted entity first.")\n            report["skipped"].append(action)\n        except (ValueError, OSError, KeyError, TypeError, PermissionError) as exc:\n            print("Workflow stopped:", ACTIONS[action], "-", exc)\n            report["failed"].append(action)\n            break\n    print("Workflow finished:", len(report["completed"]), "completed,",\n          len(report["skipped"]), "reused/not ready,", len(report["failed"]), "failed.")\n    return report\n\n\ndef main():\n    initialize()\n    names = list(ENTITIES)\n    while True:\n        print("\\n" + TITLE)\n        print("Choose an entity to run its permitted workflow (local lab role simulation):")\n        for number, name in enumerate(names, 1):\n            print(f"{number}. {name}")\n        print("0. Exit")\n        choice = input("Entity: ").strip()\n        if choice == "0":\n            break\n        if not choice.isdigit() or not 1 <= int(choice) <= len(names):\n            print("Invalid entity.")\n            continue\n        entity = names[int(choice) - 1]\n        allowed = ENTITIES[entity]\n        if not allowed:\n            print("This entity has no assigned operations.")\n            continue\n        print("Automatic steps:", " -> ".join(action for action in WORKFLOW_ORDER if action in allowed))\n        try:\n            filename, values = None, {}\n            if any(action not in ("list", "build_index", "search") for action in allowed):\n                filename = validate_filename(input("Filename: ").strip())\n            if "encrypt" in allowed and not record_path("encrypted/" + filename).exists():\n                values["plaintext"] = input("Document text: ")\n            if "homomorphic_encrypt" in allowed and not record_path("add/" + filename).exists():\n                values["num1"] = int(input("First integer: "))\n                values["num2"] = int(input("Second integer: "))\n            if "search" in allowed:\n                values["query"] = input("Search word: ")\n            run_workflow(entity, filename, **values)\n        except (ValueError, OSError, KeyError, TypeError, PermissionError) as exc:\n            print("Workflow could not complete:", exc)\n\n\n\nif __name__ == "__main__":\n    try:\n        main()\n    except (KeyboardInterrupt, EOFError):\n        print("Program closed.")\n'
 
 def validate_entities(entities):
     if not isinstance(entities, dict) or not entities:
@@ -832,7 +521,7 @@ def choose_entities():
         if count.isdigit() and 1 <= int(count) <= 100:
             break
         print("Enter an entity count from 1 to 100.")
-    print("Permissions apply to separate actions; encryption does not automatically hash or sign.")
+    print("Your selected permissions become one automatic workflow for each entity.")
     print("Entity selection is a local lab simulation, without password authentication.")
     entities = {}
     action_names = list(ACTIONS)
@@ -920,7 +609,7 @@ ALGORITHMS
 """ + "\n".join(f"  {LABELS[k]}: {v}" for k, v in selected.items()) + "\n\nENTITIES AND PERMISSIONS\n" + "\n".join(
         "  " + name + ": " + (", ".join(permissions) or "none") for name, permissions in entities.items()) + """
 
-Select an entity, then an allowed operation. Operations are separate:
+Select an entity and enter its needed inputs once. Its permitted steps run automatically:
 1. An entity with encrypt permission stores the document.
 2. An entity with hash permission saves its ciphertext hash.
 3. An entity with sign permission saves its signature and verification key.
@@ -932,13 +621,16 @@ Select an entity, then an allowed operation. Operations are separate:
 9. An entity with search sees matching filenames only, without plaintext access.
 
 The application checks permissions even for direct perform() calls, and menus
-show only allowed actions. Entity selection is a local lab role simulation,
+run only allowed actions. The workflow never grants extra permissions. Entity selection is a local lab role simulation,
 not password authentication or protection against someone editing Python or
 reading local private keys. entities.json documents the generated policy;
 the standalone program embeds that same policy in ENTITIES.
 Key wrapping/unwrapping are independently permissioned demonstrations.
-Document decryption uses the local document key and does not implicitly verify
-hashes or signatures; those are separate explicit actions for assigned entities.
+Document decryption uses the local document key. If the entity has verification
+permissions, those checks run before decryption. A failed check stops its workflow.
+Existing ciphertext/hashes/signatures/results are reused, never overwritten by
+the workflow. Missing artifacts are reported as not ready for that step.
+Create a new filename to process a new version of a document.
 Signature-internal SHA256 is inherent to signing, separate from the hash action.
 Adding a document marks an existing index stale; rebuild it before searching.
 

@@ -132,6 +132,38 @@ class EntityGeneratorTests(unittest.TestCase):
             for line in captured.getvalue().splitlines():
                 self.assertRegex(line,r'^\[\d{4}-\d\d-\d\dT')
 
+    def test_automatic_workflows(self):
+        entities = {
+            'Writer': ['encrypt', 'hash', 'sign'],
+            'Reader': ['verify_hash', 'verify_signature', 'decrypt'],
+            'Selected1256': ['encrypt', 'decrypt', 'sign', 'verify_signature'],
+        }
+        with tempfile.TemporaryDirectory() as temp, contextlib.redirect_stdout(io.StringIO()):
+            file = self.g.create_solution('Workflow', self.choices(), Path(temp)/'new', entities)
+            m = load(file)
+            m.initialize()
+            result = m.run_workflow('Writer', 'one.txt', plaintext='example text')
+            self.assertEqual(result['completed'], ['encrypt', 'hash', 'sign'])
+            self.assertEqual(m.run_workflow('Reader', 'one.txt')['completed'],
+                             ['verify_hash', 'verify_signature', 'decrypt'])
+            result = m.run_workflow('Selected1256', 'two.txt', plaintext='another record')
+            self.assertEqual(result['completed'], ['encrypt', 'sign', 'verify_signature', 'decrypt'])
+            self.assertFalse((file.parent/'hashes'/'two.txt').exists())
+            signature = (file.parent/'signature'/'one.txt').read_bytes()
+            result = m.run_workflow('Writer', 'one.txt')
+            self.assertEqual(result['skipped'], ['encrypt', 'hash', 'sign'])
+            self.assertEqual(signature, (file.parent/'signature'/'one.txt').read_bytes())
+            # Missing artifacts are reported without granting creation permissions.
+            result = m.run_workflow('Reader', 'missing.txt')
+            self.assertEqual(len(result['skipped']), 3)
+            encrypted = file.parent/'encrypted'/'one.txt'
+            data = json.loads(encrypted.read_text())
+            data['data'] = ('ff' if data['data'][:2] != 'ff' else '00') + data['data'][2:]
+            encrypted.write_text(json.dumps(data))
+            result = m.run_workflow('Reader', 'one.txt')
+            self.assertEqual(result['failed'], ['verify_hash'])
+            self.assertNotIn('decrypt', result['completed'])
+
     def test_interactive_standalone(self):
         with tempfile.TemporaryDirectory() as temp:
             generator=Path(temp)/GENERATOR.name
@@ -141,15 +173,15 @@ class EntityGeneratorTests(unittest.TestCase):
             self.assertEqual(run.returncode,0,run.stderr)
             solution=Path(temp)/'GENERATED_ENTITY_SOLUTIONS'/'CUSTOM_Demo'/'solution.py'
             self.assertTrue(solution.exists(),run.stdout)
-            # Owner encrypts, hashes, signs, verifies, builds index; Guest searches.
-            answers='\n'.join(['1','1','r.txt','fever treatment','3','r.txt','5','r.txt','6','r.txt','11','0','2','1','fever','0','0',''])
+            # Selecting Owner runs the full workflow; selecting Guest runs search/list.
+            answers='\n'.join(['1','r.txt','fever treatment','7','3','fever','2','fever','0',''])
             run=subprocess.run([sys.executable,str(solution)],input=answers,text=True,capture_output=True,timeout=30)
             self.assertEqual(run.returncode,0,run.stderr)
             self.assertIn('Signature verified: True',run.stdout)
             self.assertIn('Matching filenames: r.txt',run.stdout)
             self.assertNotIn('Operation could not complete',run.stdout)
-            # Guest's first menu item remains search after a fresh process starts.
-            run=subprocess.run([sys.executable,str(solution)],input='2\n1\nfever\n0\n0\n',text=True,capture_output=True,timeout=30)
+            # Guest workflow still searches after a fresh process starts.
+            run=subprocess.run([sys.executable,str(solution)],input='2\nfever\n0\n',text=True,capture_output=True,timeout=30)
             self.assertEqual(run.returncode,0,run.stderr)
             self.assertIn('Matching filenames: r.txt',run.stdout)
 
